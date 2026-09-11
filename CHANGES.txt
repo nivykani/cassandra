@@ -1,4 +1,5 @@
 7.0
+ * Validate the streamed Digest.crc32 against the received Data.db when receiving an entire SSTable (CASSANDRA-XXXXX)
  * Reject LIKE patterns with a wildcard (%) anywhere other than the start or end (CASSANDRA-21068)
  * Support pluggable default role initialization (CASSANDRA-21546)
  * Add prepared statement cache stats to nodetool info (CASSANDRA-14366)

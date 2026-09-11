@@ -18,10 +18,12 @@
 package org.apache.cassandra.db.streaming;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.channels.WritableByteChannel;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.Queue;
 
 import org.junit.BeforeClass;
@@ -29,13 +31,16 @@ import org.junit.Test;
 
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.Util;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.RowUpdateBuilder;
 import org.apache.cassandra.db.compaction.CompactionManager;
 import org.apache.cassandra.db.lifecycle.StreamingLifecycleTransaction;
+import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.SSTableTxnSingleStreamWriter;
+import org.apache.cassandra.io.sstable.format.SSTableFormat.Components;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.util.DataInputBuffer;
 import org.apache.cassandra.locator.InetAddressAndPort;
@@ -66,7 +71,10 @@ import io.netty.channel.embedded.EmbeddedChannel;
 
 import static java.util.Collections.emptyList;
 import static org.apache.cassandra.utils.TimeUUID.Generator.nextTimeUUID;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
 public class CassandraEntireSSTableStreamWriterTest
@@ -171,6 +179,135 @@ public class CassandraEntireSSTableStreamWriterTest
             assertEquals(1, newSstables.size());
             stt.abort();
         }
+    }
+
+    @Test
+    public void testCorruptDataComponentFailsDigestValidation() throws Throwable
+    {
+        ByteBuf serializedFile = Unpooled.buffer(8192);
+        ComponentManifest manifest = writeEntireSSTable(serializedFile);
+        corruptDataComponent(serializedFile, manifest);
+
+        assertThatThrownBy(() -> readEntireSSTable(serializedFile, manifest))
+        .isInstanceOf(IOException.class)
+        .hasMessageContaining("Digest mismatch")
+        .hasCauseInstanceOf(IOException.class);
+    }
+
+    @Test
+    public void testCorruptDataComponentAcceptedWhenValidationDisabled() throws Throwable
+    {
+        ByteBuf serializedFile = Unpooled.buffer(8192);
+        ComponentManifest manifest = writeEntireSSTable(serializedFile);
+        corruptDataComponent(serializedFile, manifest);
+
+        DatabaseDescriptor.setEntireSSTableStreamDigestValidationEnabled(false);
+        try
+        {
+            // the corruption must be accepted silently: the operator has opted out of validation
+            SSTableTxnSingleStreamWriter writer = readEntireSSTable(serializedFile, manifest);
+            assertNotNull(writer);
+            writer.abort(null);
+        }
+        finally
+        {
+            DatabaseDescriptor.setEntireSSTableStreamDigestValidationEnabled(true);
+        }
+    }
+
+    /**
+     * A sender is not obliged to stream a digest - {@code sstableloader} opens sstables with a component set that
+     * excludes it - so validation must fail open rather than rejecting the stream.
+     */
+    @Test
+    public void testMissingDigestIsAcceptedWithoutValidation() throws Throwable
+    {
+        ComponentManifest full;
+        try (ComponentContext context = ComponentContext.create(sstable))
+        {
+            full = context.manifest();
+        }
+
+        LinkedHashMap<Component, Long> withoutDigest = new LinkedHashMap<>();
+        for (Component component : full.components())
+        {
+            if (!component.equals(Components.DIGEST))
+                withoutDigest.put(component, full.sizeOf(component));
+        }
+        ComponentManifest manifest = new ComponentManifest(withoutDigest);
+        assertTrue(full.components().contains(Components.DIGEST));
+        assertFalse(manifest.components().contains(Components.DIGEST));
+
+        // serialize straight from the live component files, in manifest order, so the reader sees a digest-less stream
+        ByteBuf serializedFile = Unpooled.buffer(8192);
+        for (Component component : manifest.components())
+        {
+            try (InputStream in = descriptor.fileFor(component).newInputStream())
+            {
+                serializedFile.writeBytes(in.readAllBytes());
+            }
+        }
+
+        SSTableTxnSingleStreamWriter writer = readEntireSSTable(serializedFile, manifest);
+        assertNotNull(writer);
+        writer.abort(null);
+    }
+
+    /**
+     * Streams {@link #sstable} into {@code serializedFile} exactly as the production writer would, and returns the
+     * manifest describing what was written.
+     */
+    private ComponentManifest writeEntireSSTable(ByteBuf serializedFile) throws Exception
+    {
+        StreamSession session = setupStreamingSessionForTest();
+        EmbeddedChannel channel = createMockNettyChannel(serializedFile);
+        try (AsyncStreamingOutputPlus out = new AsyncStreamingOutputPlus(channel);
+             ComponentContext context = ComponentContext.create(sstable))
+        {
+            new CassandraEntireSSTableStreamWriter(sstable, session, context).write(out);
+            return context.manifest();
+        }
+    }
+
+    private SSTableTxnSingleStreamWriter readEntireSSTable(ByteBuf serializedFile, ComponentManifest manifest) throws Throwable
+    {
+        StreamSession session = setupStreamingSessionForTest();
+        InetAddressAndPort peer = FBUtilities.getBroadcastAddressAndPort();
+        session.prepareReceiving(new StreamSummary(sstable.metadata().id, emptyList(), 1, 5104));
+
+        CassandraStreamHeader header =
+        CassandraStreamHeader.builder()
+                             .withSSTableVersion(sstable.descriptor.version)
+                             .withSSTableLevel(0)
+                             .withEstimatedKeys(sstable.estimatedKeys())
+                             .withSections(emptyList())
+                             .withSerializationHeader(sstable.header.toComponent())
+                             .withComponentManifest(manifest)
+                             .isEntireSSTable(true)
+                             .withFirstKey(sstable.getFirst())
+                             .withTableId(sstable.metadata().id)
+                             .build();
+
+        CassandraEntireSSTableStreamReader reader =
+        new CassandraEntireSSTableStreamReader(new StreamMessageHeader(sstable.metadata().id, peer, session.planId(), false, 0, 0, 0, null),
+                                               header, session);
+
+        return (SSTableTxnSingleStreamWriter) reader.read(new DataInputBuffer(serializedFile.nioBuffer(), false));
+    }
+
+    /** Flips every bit of one byte in the middle of the Data.db region of an already-serialized stream. */
+    private static void corruptDataComponent(ByteBuf serializedFile, ComponentManifest manifest)
+    {
+        long dataOffset = 0;
+        for (Component component : manifest.components())
+        {
+            if (component.equals(Components.DATA))
+                break;
+            dataOffset += manifest.sizeOf(component);
+        }
+
+        int corruptAt = (int) (dataOffset + manifest.sizeOf(Components.DATA) / 2);
+        serializedFile.setByte(corruptAt, serializedFile.getByte(corruptAt) ^ 0xff);
     }
 
     private EmbeddedChannel createMockNettyChannel(ByteBuf serializedFile) throws Exception

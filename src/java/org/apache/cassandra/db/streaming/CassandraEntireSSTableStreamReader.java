@@ -21,6 +21,8 @@ package org.apache.cassandra.db.streaming;
 import java.io.IOException;
 import java.nio.channels.ClosedChannelException;
 import java.util.Collection;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
 import java.util.function.UnaryOperator;
 
 import org.slf4j.Logger;
@@ -39,8 +41,10 @@ import org.apache.cassandra.io.sstable.IOOptions;
 import org.apache.cassandra.io.sstable.SSTableMultiWriter;
 import org.apache.cassandra.io.sstable.SSTableTxnSingleStreamWriter;
 import org.apache.cassandra.io.sstable.SSTableZeroCopyWriter;
+import org.apache.cassandra.io.sstable.format.SSTableFormat.Components;
 import org.apache.cassandra.io.sstable.metadata.StatsMetadata;
 import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataIntegrityMetadata;
 import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.io.util.SequentialWriterOption;
 import org.apache.cassandra.schema.TableId;
@@ -48,8 +52,10 @@ import org.apache.cassandra.streaming.ProgressInfo;
 import org.apache.cassandra.streaming.StreamReceiver;
 import org.apache.cassandra.streaming.StreamSession;
 import org.apache.cassandra.streaming.messages.StreamMessageHeader;
+import org.apache.cassandra.utils.NoSpamLogger;
 
 import static java.lang.String.format;
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
 import static org.apache.cassandra.utils.FBUtilities.prettyPrintMemory;
 
 /**
@@ -137,6 +143,8 @@ public class CassandraEntireSSTableStreamReader implements IStreamReader
                              prettyPrintMemory(totalSize));
             }
 
+            validateDataDigest(writer.descriptor(), manifest);
+
             UnaryOperator<StatsMetadata> transform = stats -> stats.mutateLevel(header.sstableLevel)
                                                                    .mutateRepairedMetadata(messageHeader.repairedAt, messageHeader.pendingRepair, false);
             String description = String.format("level %s and repairedAt time %s and pendingRepair %s",
@@ -155,6 +163,67 @@ public class CassandraEntireSSTableStreamReader implements IStreamReader
             }
             throw e;
         }
+    }
+
+    /**
+     * Validates the received {@code Data.db} against the {@code Digest.crc32} that was streamed alongside it.
+     * <p>
+     * Entire-sstable streaming writes component bytes to disk verbatim, so - unlike the partial streaming paths, which
+     * either deserialize partitions or verify per-chunk CRCs on the way in - nothing on the receiving side would
+     * otherwise notice a corrupt data file until a client read it. The digest is computed by the sender when the sstable
+     * is first written and is never recomputed here, so a mismatch means the data is corrupt either on the sender's
+     * disk or in transit.
+     * <p>
+     * {@code Data.db} is the only component this can cover, and the only one it needs to: it is the sole streamed
+     * component that is neither rewritten ({@code Statistics.db}, whose own internal checksums are verified by the
+     * metadata mutation that follows this call) nor regenerated on load ({@code Filter.db}, {@code Summary.db}), and
+     * the only one for which a digest is maintained on disk.
+     * <p>
+     * A sender is not obliged to stream a digest - {@code sstableloader} in particular opens sstables with a component
+     * set that excludes it, see {@link org.apache.cassandra.io.sstable.SSTableLoader} - so an absent digest is not
+     * treated as an error. It is logged and the stream is accepted unvalidated.
+     *
+     * @throws IOException if a digest was streamed and the received data file does not match it
+     */
+    private void validateDataDigest(Descriptor descriptor, ComponentManifest manifest) throws IOException
+    {
+        if (!DatabaseDescriptor.getEntireSSTableStreamDigestValidationEnabled())
+            return;
+
+        List<Component> components = manifest.components();
+        if (!components.contains(Components.DATA) || !components.contains(Components.DIGEST))
+        {
+            session.countEntireSSTableStreamedInWithoutDigest();
+            // bulk load streams a component set without a digest, so this can be routine; rate limit it rather than
+            // emitting a line per sstable for the lifetime of a large load
+            NoSpamLogger.log(logger, NoSpamLogger.Level.WARN, 1, TimeUnit.MINUTES,
+                             "Accepting entire-sstable stream from {} without validating it: streamed components {} do " +
+                             "not include both {} and {}",
+                             session.peer, components, Components.DATA, Components.DIGEST);
+            return;
+        }
+
+        long startNanos = nanoTime();
+        try
+        {
+            new DataIntegrityMetadata.FileDigestValidator(descriptor.fileFor(Components.DATA),
+                                                          descriptor.fileFor(Components.DIGEST)).validate();
+        }
+        catch (IOException e)
+        {
+            session.countEntireSSTableDigestMismatch();
+            // deliberately not a CorruptSSTableException: that would trip this node's disk_failure_policy for
+            // corruption that most likely originated on the peer. Failing the session is the correct blast radius.
+            throw new IOException(format("[Stream #%s] Digest mismatch for %s received from %s, aborting stream",
+                                         session.planId(), descriptor, session.peer), e);
+        }
+
+        logger.debug("[Stream #{}] Validated digest of {} ({}) received from {} in {}ms",
+                     session.planId(),
+                     descriptor,
+                     prettyPrintMemory(manifest.sizeOf(Components.DATA)),
+                     session.peer,
+                     TimeUnit.NANOSECONDS.toMillis(nanoTime() - startNanos));
     }
 
     private File getDataDir(ColumnFamilyStore cfs, long totalSize) throws IOException

@@ -50,6 +50,8 @@ public class StreamingMetrics
     public final Timer incomingProcessTime;
     private final Counter entireSSTablesStreamedIn;
     private final Counter partialSSTablesStreamedIn;
+    private final Counter entireSSTableDigestMismatches;
+    private final Counter entireSSTablesStreamedInWithoutDigest;
 
     public static StreamingMetrics get(InetAddressAndPort ip)
     {
@@ -85,10 +87,24 @@ public class StreamingMetrics
 
         entireSSTablesStreamedIn = Metrics.counter(factory.createMetricName("EntireSSTablesStreamedIn"));
         partialSSTablesStreamedIn = Metrics.counter(factory.createMetricName("PartialSSTablesStreamedIn"));
+        entireSSTableDigestMismatches = Metrics.counter(factory.createMetricName("EntireSSTableDigestMismatches"));
+        entireSSTablesStreamedInWithoutDigest = Metrics.counter(factory.createMetricName("EntireSSTablesStreamedInWithoutDigest"));
     }
 
     public void countStreamedIn(boolean isEntireSSTable)
     {
         (isEntireSSTable ? entireSSTablesStreamedIn : partialSSTablesStreamedIn).inc();
+    }
+
+    /** An entire-sstable stream was rejected because the received data file did not match the streamed digest. */
+    public void countEntireSSTableDigestMismatch()
+    {
+        entireSSTableDigestMismatches.inc();
+    }
+
+    /** An entire-sstable stream was accepted without validation because the sender streamed no digest. */
+    public void countEntireSSTableStreamedInWithoutDigest()
+    {
+        entireSSTablesStreamedInWithoutDigest.inc();
     }
 }

@@ -811,6 +811,13 @@ public class Config
     public volatile int max_concurrent_automatic_sstable_upgrades = 1;
     public boolean stream_entire_sstables = true;
 
+    /**
+     * When receiving an entire-sstable (zero-copy) stream, validate the streamed {@code Digest.crc32} against the
+     * received {@code Data.db} before the sstable is made visible. Costs one sequential read of the data file per
+     * received sstable. A digest that was not streamed is logged and skipped, not treated as a failure.
+     */
+    public volatile boolean entire_sstable_stream_digest_validation_enabled = true;
+
     public volatile boolean skip_stream_disk_space_check = false;
 
     public volatile AuditLogOptions audit_logging_options = new AuditLogOptions();
