@@ -130,7 +130,6 @@ public class CMSOperations implements CMSOperationsMBean
         DatabaseDescriptor.setCmsCommitRetryMaxDelay(delayInMillis);
     }
 
-    // Deadline for removing an endpoint from the CMS while another CMS reconfiguration is in progress
     public long getCmsReconfigurationWaitTimeoutMillis()
     {
         return DatabaseDescriptor.getCmsReconfigurationWaitTimeout().to(MILLISECONDS);

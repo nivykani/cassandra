@@ -301,11 +301,8 @@ public class ReconfigureCMS extends MultiStepOperation<AdvanceCMSReconfiguration
                                                                     toRemove, failureCode.get(), failureMessage.get()));
             }
 
-            // Wait for whoever initiated the in-flight reconfiguration to finish it rather than driving it from here.
-            // Advancing someone else's sequence would mean executing its next step, and a step which adds a CMS member
-            // streams the metadata log to that member; when this node is neither the stream source nor the target that
-            // ends up in an unbounded wait (see ResponseTracker.await), which no deadline here could interrupt. Giving
-            // up once this deadline passes reports a stalled reconfiguration to the operator instead of hanging.
+            // Deliberately not driving the in-flight sequence from here: a step which adds a CMS member streams the
+            // metadata log to it, and ResponseTracker.await() has no timeout, so this deadline could not interrupt it.
             logger.info("Deferring CMS reconfiguration to remove {} until in-progress reconfiguration {} completes ({}ms remaining before giving up)",
                         toRemove, inProgress, NANOSECONDS.toMillis(retry.remainingNanos()));
             retry.maybeSleep();

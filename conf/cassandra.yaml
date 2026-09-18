@@ -1403,6 +1403,15 @@ truncate_request_timeout: 60000ms
 # Min unit: ms
 request_timeout: 10000ms
 
+# How long removing a node from the Cluster Metadata Service (decommission, removenode, assassinate,
+# or replacing a CMS member) waits for a CMS reconfiguration which is already in progress. Only one
+# reconfiguration may be prepared at a time, so the removal re-checks with backoff until this deadline
+# expires and then fails. Nothing advances a reconfiguration on a timer, so if the node which started
+# it has gone away, raise this only if you expect it to be resumed; otherwise resume or cancel the
+# stalled reconfiguration with nodetool cms. Hot-settable over JMX via CMSOperationsMBean.
+# Min unit: ms
+# cms_reconfiguration_wait_timeout: 10m
+
 # Defensive settings for protecting Cassandra from true network partitions.
 # See (CASSANDRA-14358) for details.
 #

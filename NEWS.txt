@@ -90,10 +90,21 @@ New features
       deployments that authenticate over mutual TLS. PasswordDefaultRoleInitializer
       remains the default and produces the historical behaviour. See CASSANDRA-21546
       for more information.
+    - A new cms_reconfiguration_wait_timeout option (default 10m) bounds how long removing a node
+      from the Cluster Metadata Service waits for a CMS reconfiguration which is already in
+      progress. It is hot-settable over JMX via CMSOperationsMBean. See CASSANDRA-XXXXX for more
+      information.
 
 Upgrading
 ---------
 
+    - nodetool decommission, removenode and assassinate, and replacing a CMS member, now wait for an
+      in-progress CMS reconfiguration to complete rather than failing immediately, bounded by the new
+      cms_reconfiguration_wait_timeout (default 10m). Only one reconfiguration may be prepared at a
+      time, which is why these operations previously failed outright. Nothing advances a
+      reconfiguration on a timer, so one whose initiator has gone away now surfaces as a timeout after
+      that deadline; resume or cancel it with nodetool cms to unblock the removal sooner. Waits are
+      counted by the new CMSReconfigurationRetries metric on TCMMetrics. (see CASSANDRA-XXXXX)
     - trickle_fsync is by default set to "true" instead of "false" in cassandra.yaml (see CASSANDRA-21572)
     - Authorizing a batch or an Accord transaction now performs the table permission checks once per run of
       consecutive statements on the same table rather than once per statement. The permissions required are

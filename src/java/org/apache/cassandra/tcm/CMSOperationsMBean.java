@@ -36,7 +36,6 @@ public interface CMSOperationsMBean
     public long getCmsCommitRetryMaxDelayMillis();
     public void setCmsCommitRetryMaxDelayMillis(long delayInMillis);
 
-    // Deadline for removing an endpoint from the CMS while another CMS reconfiguration is in progress
     public long getCmsReconfigurationWaitTimeoutMillis();
     public void setCmsReconfigurationWaitTimeoutMillis(long timeoutInMillis);
 
