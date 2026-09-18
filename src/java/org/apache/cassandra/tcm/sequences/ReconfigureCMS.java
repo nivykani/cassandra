@@ -256,7 +256,7 @@ public class ReconfigureCMS extends MultiStepOperation<AdvanceCMSReconfiguration
         if (!metadata.fullCMSMembers().contains(toRemove))
             return;
 
-        long deadlineNanos = nanoTime() + DatabaseDescriptor.getCmsCommitTimeout().to(NANOSECONDS);
+        long deadlineNanos = nanoTime() + DatabaseDescriptor.getCmsReconfigurationWaitTimeout().to(NANOSECONDS);
         RetryStrategy backoffWithJitter = DatabaseDescriptor.getCmsCommitRetryStrategy();
         Retry retry = Retry.until(deadlineNanos, TCMMetrics.instance.cmsReconfigurationRetries, backoffWithJitter);
         MultiStepOperation<?> inProgress = null;
@@ -336,7 +336,7 @@ public class ReconfigureCMS extends MultiStepOperation<AdvanceCMSReconfiguration
         throw new IllegalStateException(String.format("Timed out after %s waiting to reconfigure the CMS to remove %s: " +
                                                         "another CMS reconfiguration (%s) was in progress for the entire wait " +
                                                         "and could not be driven to completion.",
-                                                        DatabaseDescriptor.getCmsCommitTimeout(), toRemove, inProgress));
+                                                        DatabaseDescriptor.getCmsReconfigurationWaitTimeout(), toRemove, inProgress));
     }
 
     private static void initiateRemoteStreaming(Replica replicaForStreaming, Set<InetAddressAndPort> streamCandidates)

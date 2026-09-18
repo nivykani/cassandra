@@ -339,18 +339,17 @@ public class ReconfigureCMSTest extends FuzzTestBase
         {
             cluster.get(1).nodetoolResult("cms", "reconfigure", "3").asserts().success();
             cluster.get(1).runOnInstance(() -> {
-                long originalCommitTimeout = DatabaseDescriptor.getCmsCommitTimeout().to(TimeUnit.MILLISECONDS);
                 long originalInitialDelay = DatabaseDescriptor.getCmsCommitRetryInitialDelay().to(TimeUnit.MILLISECONDS);
                 long originalMaxDelay = DatabaseDescriptor.getCmsCommitRetryMaxDelay().to(TimeUnit.MILLISECONDS);
                 try
                 {
-                    // Shorten the backoff so the deferred checks below are quick, but leave the commit timeout
-                    // generous. It is a process-wide setting which also bounds the paxos repair, progress barriers
-                    // and per-step commits that finishInProgressSequences performs once the slot frees up, so
-                    // squeezing it would make this test sensitive to CI slowness rather than to the code under test.
+                    // Shorten the backoff so the deferred checks below are quick. Note that cms_commit_timeout is
+                    // deliberately left alone: the wait loop is bounded by cms_reconfiguration_wait_timeout, whose
+                    // default leaves ample room, and squeezing the commit timeout would also squeeze the paxos repair,
+                    // progress barriers and per-step commits that finishInProgressSequences performs once the slot
+                    // frees up, making this test sensitive to CI slowness rather than to the code under test.
                     DatabaseDescriptor.setCmsCommitRetryInitialDelay(10);
                     DatabaseDescriptor.setCmsCommitRetryMaxDelay(50);
-                    DatabaseDescriptor.setCmsCommitTimeout(TimeUnit.MINUTES.toMillis(1));
 
                     InetAddressAndPort self = FBUtilities.getBroadcastAddressAndPort();
                     ClusterMetadata current = ClusterMetadata.current();
@@ -381,7 +380,6 @@ public class ReconfigureCMSTest extends FuzzTestBase
                 }
                 finally
                 {
-                    DatabaseDescriptor.setCmsCommitTimeout(originalCommitTimeout);
                     DatabaseDescriptor.setCmsCommitRetryMaxDelay(originalMaxDelay);
                     DatabaseDescriptor.setCmsCommitRetryInitialDelay(originalInitialDelay);
                 }
@@ -399,7 +397,7 @@ public class ReconfigureCMSTest extends FuzzTestBase
         {
             cluster.get(1).nodetoolResult("cms", "reconfigure", "3").asserts().success();
             cluster.get(1).runOnInstance(() -> {
-                long originalCommitTimeout = DatabaseDescriptor.getCmsCommitTimeout().to(TimeUnit.MILLISECONDS);
+                long originalWaitTimeout = DatabaseDescriptor.getCmsReconfigurationWaitTimeout().to(TimeUnit.MILLISECONDS);
                 long originalInitialDelay = DatabaseDescriptor.getCmsCommitRetryInitialDelay().to(TimeUnit.MILLISECONDS);
                 long originalMaxDelay = DatabaseDescriptor.getCmsCommitRetryMaxDelay().to(TimeUnit.MILLISECONDS);
                 try
@@ -414,7 +412,7 @@ public class ReconfigureCMSTest extends FuzzTestBase
                     // and sub-millisecond waits would let the loop spin instead of actually backing off.
                     DatabaseDescriptor.setCmsCommitRetryInitialDelay(20);
                     DatabaseDescriptor.setCmsCommitRetryMaxDelay(50);
-                    DatabaseDescriptor.setCmsCommitTimeout(TimeUnit.SECONDS.toMillis(2));
+                    DatabaseDescriptor.setCmsReconfigurationWaitTimeout(TimeUnit.SECONDS.toMillis(2));
 
                     // Stub the in-progress-sequence lookup to report "occupied" forever
                     MultiStepOperation<?> placeholder = ReconfigureCMS.newSequence(LockedRanges.keyFor(ClusterMetadata.current().nextEpoch()), PrepareCMSReconfiguration.Diff.NOCHANGE);
@@ -444,7 +442,7 @@ public class ReconfigureCMSTest extends FuzzTestBase
                 }
                 finally
                 {
-                    DatabaseDescriptor.setCmsCommitTimeout(originalCommitTimeout);
+                    DatabaseDescriptor.setCmsReconfigurationWaitTimeout(originalWaitTimeout);
                     DatabaseDescriptor.setCmsCommitRetryMaxDelay(originalMaxDelay);
                     DatabaseDescriptor.setCmsCommitRetryInitialDelay(originalInitialDelay);
                 }

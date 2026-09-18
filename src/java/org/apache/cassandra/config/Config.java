@@ -239,6 +239,21 @@ public class Config
     public volatile DurationSpec.LongMillisecondsBound cms_commit_retry_initial_delay = new DurationSpec.LongMillisecondsBound("5s");
     public volatile DurationSpec.LongMillisecondsBound cms_commit_retry_max_delay = new DurationSpec.LongMillisecondsBound("60s");
 
+    /**
+     * Deadline for removing an endpoint from the CMS (decommission, removenode, assassinate and replacing a CMS
+     * member) when a CMS reconfiguration is already in progress. Only one reconfiguration may be prepared at a time,
+     * so the removal repeatedly attempts to drive the in-flight one to completion, backing off between attempts with
+     * cms_commit_retry_initial_delay/cms_commit_retry_max_delay, until this deadline expires.
+     *
+     * This is deliberately separate from cms_commit_timeout, which bounds a single commit. Sharing that setting would
+     * mean one commit could consume the entire budget for waiting out a concurrent reconfiguration, and would tie the
+     * length of time a decommission can block to a value tuned for Paxos contention.
+     *
+     * Note that a deadline shorter than cms_commit_timeout does not interrupt a commit already in flight; it only
+     * stops further attempts from being made. Hot-settable via JMX without restart.
+     */
+    public volatile DurationSpec.LongMillisecondsBound cms_reconfiguration_wait_timeout = new DurationSpec.LongMillisecondsBound("10m");
+
     public volatile int epoch_aware_debounce_inflight_tracker_max_size = 100;
 
     /**
