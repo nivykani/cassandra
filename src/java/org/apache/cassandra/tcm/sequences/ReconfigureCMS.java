@@ -82,7 +82,6 @@ import org.apache.cassandra.tcm.serialization.Version;
 import org.apache.cassandra.tcm.transformations.cms.AdvanceCMSReconfiguration;
 import org.apache.cassandra.tcm.transformations.cms.PrepareCMSReconfiguration;
 import org.apache.cassandra.utils.FBUtilities;
-import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.concurrent.Future;
 
 import static java.util.concurrent.TimeUnit.NANOSECONDS;
@@ -302,40 +301,19 @@ public class ReconfigureCMS extends MultiStepOperation<AdvanceCMSReconfiguration
                                                                     toRemove, failureCode.get(), failureMessage.get()));
             }
 
-            logger.info("Found in-progress CMS reconfiguration {} while trying to remove {}, attempting to drive it to " +
-                        "completion before retrying ({}ms remaining before giving up)",
-                        inProgress, toRemove, NANOSECONDS.toMillis(retry.remainingNanos()));
-
-            // Nothing advances these sequences on a timer; they are only driven by whoever initiated them. If that
-            // node has gone away, or its own attempt errored out part way through, the sequence would sit in the log
-            // until an operator intervened and we would do nothing but wait for the deadline. Any node may legally
-            // drive a CMS reconfiguration to completion, so do that here instead of waiting for someone else to.
-            try
-            {
-                InProgressSequences.finishInProgressSequences(SequenceKey.instance);
-            }
-            catch (Throwable t)
-            {
-                // Advancing may legitimately fail: another node may be driving the same sequence and win a race on
-                // one of its steps, or a step may need streaming which fails. Neither is fatal to us, so log it and
-                // re-assess after backing off.
-                JVMStabilityInspector.inspectThrowable(t);
-                logger.info("Could not advance in-progress CMS reconfiguration {}, will re-check after backing off", inProgress, t);
-            }
-
-            current = ClusterMetadata.current();
-            // The reconfiguration we just advanced may itself have removed the endpoint, in which case we are done
-            // and there is no reason to back off first.
-            if (!current.fullCMSMembers().contains(toRemove))
-                return;
-
+            // Wait for whoever initiated the in-flight reconfiguration to finish it rather than driving it from here.
+            // Advancing someone else's sequence would mean executing its next step, and a step which adds a CMS member
+            // streams the metadata log to that member; when this node is neither the stream source nor the target that
+            // ends up in an unbounded wait (see ResponseTracker.await), which no deadline here could interrupt. Giving
+            // up once this deadline passes reports a stalled reconfiguration to the operator instead of hanging.
+            logger.info("Deferring CMS reconfiguration to remove {} until in-progress reconfiguration {} completes ({}ms remaining before giving up)",
+                        toRemove, inProgress, NANOSECONDS.toMillis(retry.remainingNanos()));
             retry.maybeSleep();
             current = ClusterMetadata.current();
         }
 
         throw new IllegalStateException(String.format("Timed out after %s waiting to reconfigure the CMS to remove %s: " +
-                                                        "another CMS reconfiguration (%s) was in progress for the entire wait " +
-                                                        "and could not be driven to completion.",
+                                                        "another CMS reconfiguration (%s) has been in progress for the entire wait.",
                                                         DatabaseDescriptor.getCmsReconfigurationWaitTimeout(), toRemove, inProgress));
     }
 
