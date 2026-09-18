@@ -26,11 +26,15 @@ import java.util.List;
 import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 import org.junit.Assert;
 import org.junit.Test;
 
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.distributed.Cluster;
 import org.apache.cassandra.distributed.api.ConsistencyLevel;
 import org.apache.cassandra.distributed.api.Feature;
@@ -38,14 +42,18 @@ import org.apache.cassandra.distributed.api.IInvokableInstance;
 import org.apache.cassandra.distributed.api.TokenSupplier;
 import org.apache.cassandra.distributed.shared.ClusterUtils;
 import org.apache.cassandra.distributed.shared.NetworkTopology;
+import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.locator.MetaStrategy;
+import org.apache.cassandra.metrics.TCMMetrics;
 import org.apache.cassandra.schema.DistributedMetadataLogKeyspace;
 import org.apache.cassandra.schema.ReplicationParams;
 import org.apache.cassandra.service.paxos.Ballot;
 import org.apache.cassandra.service.paxos.PaxosRepairHistory;
 import org.apache.cassandra.tcm.ClusterMetadata;
 import org.apache.cassandra.tcm.ClusterMetadataService;
+import org.apache.cassandra.tcm.MultiStepOperation;
 import org.apache.cassandra.tcm.ownership.DataPlacement;
+import org.apache.cassandra.tcm.sequences.LockedRanges;
 import org.apache.cassandra.tcm.sequences.ProgressBarrier;
 import org.apache.cassandra.tcm.sequences.ReconfigureCMS;
 import org.apache.cassandra.tcm.transformations.cms.PrepareCMSReconfiguration;
@@ -318,6 +326,129 @@ public class ReconfigureCMSTest extends FuzzTestBase
                                         .start())
         {
             cluster.get(1).nodetoolResult("cms", "reconfigure", "3").asserts().success();
+        }
+    }
+
+    @Test
+    public void maybeReconfigureCMSWaitsForInProgressReconfigurationThenSucceeds() throws Throwable
+    {
+        try (Cluster cluster = builder().withNodes(3)
+                                        .withConfig(c -> c.with(Feature.NETWORK))
+                                        .withoutVNodes()
+                                        .start())
+        {
+            cluster.get(1).nodetoolResult("cms", "reconfigure", "3").asserts().success();
+            cluster.get(1).runOnInstance(() -> {
+                long originalCommitTimeout = DatabaseDescriptor.getCmsCommitTimeout().to(TimeUnit.MILLISECONDS);
+                long originalInitialDelay = DatabaseDescriptor.getCmsCommitRetryInitialDelay().to(TimeUnit.MILLISECONDS);
+                long originalMaxDelay = DatabaseDescriptor.getCmsCommitRetryMaxDelay().to(TimeUnit.MILLISECONDS);
+                try
+                {
+                    // Shorten the backoff so the deferred checks below are quick, but leave the commit timeout
+                    // generous. It is a process-wide setting which also bounds the paxos repair, progress barriers
+                    // and per-step commits that finishInProgressSequences performs once the slot frees up, so
+                    // squeezing it would make this test sensitive to CI slowness rather than to the code under test.
+                    DatabaseDescriptor.setCmsCommitRetryInitialDelay(10);
+                    DatabaseDescriptor.setCmsCommitRetryMaxDelay(50);
+                    DatabaseDescriptor.setCmsCommitTimeout(TimeUnit.MINUTES.toMillis(1));
+
+                    InetAddressAndPort self = FBUtilities.getBroadcastAddressAndPort();
+                    ClusterMetadata current = ClusterMetadata.current();
+                    Assert.assertTrue(current.fullCMSMembers().contains(self));
+
+                    // Stub the in-progress sequence to be "occupied" for 3 checks, and then "free" for any check after that
+                    MultiStepOperation<?> placeholder = ReconfigureCMS.newSequence(LockedRanges.keyFor(current.nextEpoch()), PrepareCMSReconfiguration.Diff.NOCHANGE);
+                    AtomicInteger lookupCalls = new AtomicInteger();
+                    Function<ClusterMetadata, MultiStepOperation<?>> previousLookup =
+                        ReconfigureCMS.replaceInProgressCMSSequenceLookup(m -> lookupCalls.incrementAndGet() <= 3 ? placeholder : null);
+
+                    long retriesBefore = TCMMetrics.instance.cmsReconfigurationRetries.getCount();
+                    try
+                    {
+                        ReconfigureCMS.maybeReconfigureCMS(current, self);
+                    }
+                    finally
+                    {
+                        ReconfigureCMS.replaceInProgressCMSSequenceLookup(previousLookup);
+                    }
+
+                    // 3 "occupied" responses followed by the 4th "free" one
+                    Assert.assertEquals(4, lookupCalls.get());
+                    Assert.assertEquals(retriesBefore + 3, TCMMetrics.instance.cmsReconfigurationRetries.getCount());
+                    ClusterMetadata after = ClusterMetadata.current();
+                    Assert.assertFalse(after.fullCMSMembers().contains(self));
+                    Assert.assertNull(after.inProgressSequences.get(ReconfigureCMS.SequenceKey.instance));
+                }
+                finally
+                {
+                    DatabaseDescriptor.setCmsCommitTimeout(originalCommitTimeout);
+                    DatabaseDescriptor.setCmsCommitRetryMaxDelay(originalMaxDelay);
+                    DatabaseDescriptor.setCmsCommitRetryInitialDelay(originalInitialDelay);
+                }
+            });
+        }
+    }
+
+    @Test
+    public void maybeReconfigureCMSTimesOutWhenExistingReconfigurationNeverClears() throws Throwable
+    {
+        try (Cluster cluster = builder().withNodes(3)
+                                        .withConfig(c -> c.with(Feature.NETWORK))
+                                        .withoutVNodes()
+                                        .start())
+        {
+            cluster.get(1).nodetoolResult("cms", "reconfigure", "3").asserts().success();
+            cluster.get(1).runOnInstance(() -> {
+                long originalCommitTimeout = DatabaseDescriptor.getCmsCommitTimeout().to(TimeUnit.MILLISECONDS);
+                long originalInitialDelay = DatabaseDescriptor.getCmsCommitRetryInitialDelay().to(TimeUnit.MILLISECONDS);
+                long originalMaxDelay = DatabaseDescriptor.getCmsCommitRetryMaxDelay().to(TimeUnit.MILLISECONDS);
+                try
+                {
+                    InetAddressAndPort self = FBUtilities.getBroadcastAddressAndPort();
+
+                    // The backoff is full jitter over [0, cms_commit_retry_max_delay] once the exponential growth
+                    // reaches the cap, so a 2s deadline leaves room for tens of deferred checks. Asserting only a
+                    // handful of them below keeps this a test of the wait loop rather than a wall-clock race: it
+                    // would take a stall of well over a second to push the count under the threshold. The delays are
+                    // also kept above a millisecond because Retry truncates the computed wait to whole milliseconds,
+                    // and sub-millisecond waits would let the loop spin instead of actually backing off.
+                    DatabaseDescriptor.setCmsCommitRetryInitialDelay(20);
+                    DatabaseDescriptor.setCmsCommitRetryMaxDelay(50);
+                    DatabaseDescriptor.setCmsCommitTimeout(TimeUnit.SECONDS.toMillis(2));
+
+                    // Stub the in-progress-sequence lookup to report "occupied" forever
+                    MultiStepOperation<?> placeholder = ReconfigureCMS.newSequence(LockedRanges.keyFor(ClusterMetadata.current().nextEpoch()), PrepareCMSReconfiguration.Diff.NOCHANGE);
+                    Function<ClusterMetadata, MultiStepOperation<?>> previousLookup =
+                        ReconfigureCMS.replaceInProgressCMSSequenceLookup(m -> placeholder);
+
+                    long retriesBefore = TCMMetrics.instance.cmsReconfigurationRetries.getCount();
+                    try
+                    {
+                        try
+                        {
+                            ReconfigureCMS.maybeReconfigureCMS(ClusterMetadata.current(), self);
+                            Assert.fail("Expected IllegalStateException after timing out waiting for the CMS reconfiguration slot to clear");
+                        }
+                        catch (IllegalStateException e)
+                        {
+                            Assert.assertTrue(e.getMessage(), e.getMessage().contains("Timed out"));
+                            long retries = TCMMetrics.instance.cmsReconfigurationRetries.getCount() - retriesBefore;
+                            Assert.assertTrue("Expected the wait loop to back off repeatedly before giving up, but it retried " + retries + " time(s)",
+                                              retries >= 5);
+                        }
+                    }
+                    finally
+                    {
+                        ReconfigureCMS.replaceInProgressCMSSequenceLookup(previousLookup);
+                    }
+                }
+                finally
+                {
+                    DatabaseDescriptor.setCmsCommitTimeout(originalCommitTimeout);
+                    DatabaseDescriptor.setCmsCommitRetryMaxDelay(originalMaxDelay);
+                    DatabaseDescriptor.setCmsCommitRetryInitialDelay(originalInitialDelay);
+                }
+            });
         }
     }
 
