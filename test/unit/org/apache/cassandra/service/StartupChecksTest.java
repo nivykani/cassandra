@@ -31,6 +31,7 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.ServiceConfigurationError;
 import java.util.ServiceLoader;
 import java.util.Set;
@@ -45,7 +46,9 @@ import org.junit.Assert;
 import org.junit.Assume;
 import org.junit.Before;
 import org.junit.BeforeClass;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
 import org.mockito.MockedStatic;
 import org.mockito.Mockito;
 
@@ -83,6 +86,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
@@ -108,6 +112,9 @@ public class StartupChecksTest
     StartupChecks startupChecks;
     Path sstableDir;
     File heartbeatFile;
+
+    @Rule
+    public TemporaryFolder sysBlockDir = new TemporaryFolder();
 
     StartupChecksConfiguration options = new StartupChecksConfiguration(new StartupChecks().withDefaultTests(), new HashMap<>());
 
@@ -209,8 +216,64 @@ public class StartupChecksTest
         Path dirWithoutNumbers = StartupChecks.getReadAheadKBPath("/dev/sca");
         assertEquals(Paths.get("/sys/block/sca/queue/read_ahead_kb"), dirWithoutNumbers);
 
+        // device-mapper alias with no matching /sys/block/dm-* entry on this host: falls back
+        // to the raw alias instead of the literal "mapper" path segment.
+        Path mapperDirectory = StartupChecks.getReadAheadKBPath("/dev/mapper/luks-85ac2c82-8b38-414e-a4ee-22fd1910bc53");
+        assertEquals(Paths.get("/sys/block/luks-85ac2c82-8b38-414e-a4ee-22fd1910bc53/queue/read_ahead_kb"), mapperDirectory);
+
         Path invalidDir = StartupChecks.getReadAheadKBPath("/invaliddir/xpto");
         Assert.assertNull(invalidDir);
+    }
+
+    @Test
+    public void resolveDeviceMapperNameResolvesKnownAlias() throws IOException
+    {
+        createDmDevice("dm-1", "luks-aaaa");
+        createDmDevice("dm-4", "luks-85ac2c82-8b38-414e-a4ee-22fd1910bc53");
+
+        Optional<String> resolved = StartupChecks.resolveDeviceMapperName(
+            "luks-85ac2c82-8b38-414e-a4ee-22fd1910bc53", sysBlockDir.getRoot().toPath());
+
+        assertEquals(Optional.of("dm-4"), resolved);
+    }
+
+    @Test
+    public void resolveDeviceMapperNameReturnsEmptyForUnknownAlias() throws IOException
+    {
+        createDmDevice("dm-1", "luks-aaaa");
+
+        Optional<String> resolved = StartupChecks.resolveDeviceMapperName(
+            "luks-does-not-exist", sysBlockDir.getRoot().toPath());
+
+        assertFalse(resolved.isPresent());
+    }
+
+    @Test
+    public void resolveDeviceMapperNameReturnsEmptyWhenSysBlockMissing()
+    {
+        Optional<String> resolved = StartupChecks.resolveDeviceMapperName(
+            "luks-aaaa", sysBlockDir.getRoot().toPath().resolve("does-not-exist"));
+
+        assertFalse(resolved.isPresent());
+    }
+
+    @Test
+    public void resolveDeviceMapperNameSkipsDmDeviceMissingNameFileAndKeepsScanning() throws IOException
+    {
+        sysBlockDir.newFolder("dm-0"); // e.g. a dm device with no dm/name entry
+        createDmDevice("dm-1", "luks-bbbb");
+
+        Optional<String> resolved = StartupChecks.resolveDeviceMapperName(
+            "luks-bbbb", sysBlockDir.getRoot().toPath());
+
+        assertEquals(Optional.of("dm-1"), resolved);
+    }
+
+    private void createDmDevice(String dmName, String alias) throws IOException
+    {
+        Path dmDir = sysBlockDir.getRoot().toPath().resolve(dmName).resolve("dm");
+        Files.createDirectories(dmDir);
+        Files.write(dmDir.resolve("name"), (alias + "\n").getBytes(StandardCharsets.UTF_8));
     }
 
     @Test

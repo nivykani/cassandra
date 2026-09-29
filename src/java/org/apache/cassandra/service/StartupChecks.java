@@ -22,6 +22,7 @@ import java.io.IOException;
 import java.lang.management.ManagementFactory;
 import java.lang.management.RuntimeMXBean;
 import java.nio.ByteBuffer;
+import java.nio.file.DirectoryStream;
 import java.nio.file.FileStore;
 import java.nio.file.FileVisitResult;
 import java.nio.file.FileVisitor;
@@ -1193,7 +1194,20 @@ public class StartupChecks
             String[] blockDirComponents = blockDirectoryPath.split("/");
             if (blockDirComponents.length >= 2 && blockDirComponents[1].equals("dev"))
             {
-                String deviceName = blockDirComponents[2].replaceAll("[0-9]*$", "");
+                String deviceName;
+                if (blockDirComponents.length >= 4 && blockDirComponents[2].equals("mapper"))
+                {
+                    // device-mapper volumes (e.g. LUKS-encrypted disks) are mounted under
+                    // /dev/mapper/<alias>. /sys/block is indexed by the real kernel device
+                    // (e.g. dm-4), not the alias, so resolve it before building the sysfs path.
+                    String mapperAlias = blockDirComponents[3];
+                    deviceName = resolveDeviceMapperName(mapperAlias).orElse(mapperAlias);
+                }
+                else
+                {
+                    deviceName = blockDirComponents[2].replaceAll("[0-9]*$", "");
+                }
+
                 if (StringUtils.isNotEmpty(deviceName))
                 {
                     readAheadKBPath = File.getPath(String.format(READ_AHEAD_KB_SETTING_PATH, deviceName));
@@ -1206,6 +1220,50 @@ public class StartupChecks
         }
 
         return readAheadKBPath;
+    }
+
+    /**
+     * Resolves a Linux device-mapper alias (e.g. a LUKS-encrypted volume mounted under
+     * /dev/mapper/&lt;alias&gt;) to the underlying kernel block device name (e.g. dm-4),
+     * by scanning /sys/block/dm-*&#47;dm/name.
+     */
+    private static Optional<String> resolveDeviceMapperName(String mapperAlias)
+    {
+        return resolveDeviceMapperName(mapperAlias, File.getPath("/sys/block"));
+    }
+
+    @VisibleForTesting
+    static Optional<String> resolveDeviceMapperName(String mapperAlias, Path sysBlockDir)
+    {
+        if (Files.notExists(sysBlockDir))
+            return Optional.empty();
+
+        try (DirectoryStream<Path> dmDevices = Files.newDirectoryStream(sysBlockDir, "dm-*"))
+        {
+            for (Path dmDevice : dmDevices)
+            {
+                Path nameFile = dmDevice.resolve("dm").resolve("name");
+                if (Files.notExists(nameFile))
+                    continue;
+
+                try
+                {
+                    List<String> lines = Files.readAllLines(nameFile);
+                    if (!lines.isEmpty() && mapperAlias.equals(lines.get(0).trim()))
+                        return Optional.of(dmDevice.getFileName().toString());
+                }
+                catch (IOException e)
+                {
+                    logger.debug("Unable to read device-mapper name file {}.", nameFile, e);
+                }
+            }
+        }
+        catch (IOException e)
+        {
+            logger.debug("Unable to scan {} for device-mapper devices.", sysBlockDir, e);
+        }
+
+        return Optional.empty();
     }
 
     @VisibleForTesting
